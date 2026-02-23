@@ -4,4 +4,4 @@
 # Reload sxhkd after editing: pkill -USR1 sxhkd
 
 super + grave
-    bun run --cwd /home/keith/keith_apps/speech_to_text toggle
+    bun run --cwd /home/keith/keith_apps/speech_transcriber toggle

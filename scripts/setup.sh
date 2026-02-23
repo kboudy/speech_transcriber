@@ -134,14 +134,14 @@ fi
 SXHKD_CONFIG="$HOME/.config/sxhkd/sxhkdrc"
 mkdir -p "$(dirname "$SXHKD_CONFIG")"
 
-STT_BLOCK="# ── STT toggle (managed by speech_to_text) ──
+STT_BLOCK="# ── STT toggle (managed by speech_transcriber) ──
 $(cat "$PROJECT_DIR/config/sxhkdrc")"
 
 if [[ ! -f "$SXHKD_CONFIG" ]]; then
   info "Creating sxhkd config..."
   echo "$STT_BLOCK" > "$SXHKD_CONFIG"
   success "Created $SXHKD_CONFIG"
-elif grep -q "speech_to_text\|stt-daemon" "$SXHKD_CONFIG"; then
+elif grep -q "speech_transcriber\|stt-daemon" "$SXHKD_CONFIG"; then
   info "sxhkd config already contains STT binding — skipping"
 else
   info "Appending STT hotkey to existing $SXHKD_CONFIG..."

@@ -15,11 +15,13 @@ bun run setup
 ```
 
 **Prerequisites:**
+
 - [Ollama](https://ollama.com/download) installed and running
 - Bun installed
 - NVIDIA driver installed (`nvidia-smi` should work)
 
 The setup script will:
+
 1. Install system dependencies (`xdotool`, `sxhkd`, `parecord`/`arecord`, `nvidia-cuda-toolkit`)
 2. Clone and build `whisper.cpp` with CUDA GPU support
 3. Download the `large-v3` Whisper model (~3GB)
@@ -32,6 +34,7 @@ If you already have `nvidia-cuda-toolkit` installed, step 1 will skip it.
 ## Usage
 
 **Start the daemon:**
+
 ```bash
 systemctl --user start stt-daemon
 # or manually:
@@ -46,7 +49,7 @@ Add these lines to `~/.xinitrc` before the `exec dwm` line:
 
 ```bash
 sxhkd &
-/home/keith/.bun/bin/bun run --cwd /home/keith/keith_apps/speech_to_text daemon &
+/home/keith/.bun/bin/bun run --cwd /home/keith/keith_apps/speech_transcriber daemon &
 ```
 
 **Change the hotkey:** edit [config/sxhkdrc](config/sxhkdrc), then `pkill -USR1 sxhkd`
@@ -55,13 +58,13 @@ sxhkd &
 
 Copy `.env.example` to `.env` and edit:
 
-| Variable | Default | Description |
-|---|---|---|
-| `WHISPER_BIN` | `~/.local/share/stt/whisper.cpp/build/bin/whisper-cli` | Path to whisper.cpp binary |
-| `WHISPER_MODEL` | `~/.local/share/stt/models/ggml-large-v3.bin` | Whisper model file |
-| `OLLAMA_MODEL` | `llama3.2:3b` | Ollama model for text cleanup |
-| `SKIP_LLM` | `false` | Set to `true` to skip LLM cleanup |
-| `OUTPUT_METHOD` | `type` | `type` (xdotool) or `clipboard` (Ctrl+V) |
+| Variable        | Default                                                | Description                              |
+| --------------- | ------------------------------------------------------ | ---------------------------------------- |
+| `WHISPER_BIN`   | `~/.local/share/stt/whisper.cpp/build/bin/whisper-cli` | Path to whisper.cpp binary               |
+| `WHISPER_MODEL` | `~/.local/share/stt/models/ggml-large-v3.bin`          | Whisper model file                       |
+| `OLLAMA_MODEL`  | `llama3.2:3b`                                          | Ollama model for text cleanup            |
+| `SKIP_LLM`      | `false`                                                | Set to `true` to skip LLM cleanup        |
+| `OUTPUT_METHOD` | `type`                                                 | `type` (xdotool) or `clipboard` (Ctrl+V) |
 
 ## Status bar (dwm)
 
