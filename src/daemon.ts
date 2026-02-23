@@ -221,12 +221,14 @@ async function stopAndProcess() {
   state = "processing";
   await setStatus("[...]");
 
-  // Stop recording
-  recordingProcess?.kill("SIGTERM");
+  // Stop recording and wait for the process to fully exit so all buffered
+  // audio is flushed to disk before we hand the file to whisper
+  const proc = recordingProcess;
   recordingProcess = null;
-
-  // Brief pause to ensure audio is fully flushed to disk
-  await Bun.sleep(250);
+  proc?.kill("SIGTERM");
+  if (proc) {
+    await Promise.race([proc.exited, Bun.sleep(3000)]);
+  }
 
   try {
     await setStatus("[STT]");
