@@ -8,7 +8,8 @@
     "toggle": "bun run src/toggle.ts",
     "devices": "bun run src/devices.ts",
     "setup": "bash scripts/setup.sh",
-    "last_stt": "bun run src/last_stt.ts"
+    "last_stt": "bun run src/last_stt.ts",
+    "logs": "journalctl  --no-pager --user -u stt-daemon -n 50"
   },
   "devDependencies": {
     "@types/bun": "latest"
