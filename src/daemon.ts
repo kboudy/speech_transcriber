@@ -69,6 +69,7 @@ async function getRecordingCommand(): Promise<string[]> {
       "--channels=1",
       "--rate=16000",
       "--format=s16le",
+      "--latency-msec=50", // small buffer so <50ms of audio is lost on SIGTERM
     ];
     if (AUDIO_DEVICE) cmd.push(`--device=${AUDIO_DEVICE}`);
     cmd.push(AUDIO_FILE);
