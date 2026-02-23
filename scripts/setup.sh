@@ -160,6 +160,8 @@ fi
 SERVICE_DIR="$HOME/.config/systemd/user"
 mkdir -p "$SERVICE_DIR"
 
+BUN_BIN="$(command -v bun 2>/dev/null || echo "$HOME/.bun/bin/bun")"
+
 cat > "$SERVICE_DIR/stt-daemon.service" << EOF
 [Unit]
 Description=Speech-to-Text Daemon
@@ -169,22 +171,48 @@ PartOf=graphical-session.target
 [Service]
 Type=simple
 WorkingDirectory=$PROJECT_DIR
-ExecStart=/usr/bin/env bun run daemon
+ExecStart=$BUN_BIN $PROJECT_DIR/src/daemon.ts
 Restart=on-failure
 RestartSec=3
-Environment=DISPLAY=:0
+Environment=DISPLAY=$DISPLAY_NUM
+Environment=XAUTHORITY=$XAUTH_PATH
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+
+# Detect current display for the service (auto-detect in script as fallback)
+DISPLAY_NUM="${DISPLAY:-:1}"
+XAUTH_PATH="${XAUTHORITY:-/run/user/$(id -u)/gdm/Xauthority}"
+[[ -f "$XAUTH_PATH" ]] || XAUTH_PATH="$HOME/.Xauthority"
+
+cat > "$SERVICE_DIR/stt-status.service" << EOF
+[Unit]
+Description=dwm Status Bar (STT mic indicator + clock)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=$PROJECT_DIR
+ExecStart=$PROJECT_DIR/scripts/dwm-status.sh
+Restart=on-failure
+RestartSec=3
+Environment=DISPLAY=$DISPLAY_NUM
+Environment=XAUTHORITY=$XAUTH_PATH
 
 [Install]
 WantedBy=graphical-session.target
 EOF
 
 systemctl --user daemon-reload
-systemctl --user enable stt-daemon.service
+systemctl --user enable stt-daemon.service stt-status.service
 
-success "systemd service installed: stt-daemon.service"
-info "  Start:   systemctl --user start stt-daemon"
-info "  Stop:    systemctl --user stop stt-daemon"
+success "systemd services installed: stt-daemon.service, stt-status.service"
+info "  Start:   systemctl --user start stt-daemon stt-status"
+info "  Stop:    systemctl --user stop stt-daemon stt-status"
 info "  Logs:    journalctl --user -fu stt-daemon"
+info "  Logs:    journalctl --user -fu stt-status"
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 
@@ -192,9 +220,8 @@ echo ""
 success "Setup complete!"
 echo ""
 echo "  Hotkey:     Super + grave (backtick)  [edit config/sxhkdrc to change]"
-echo "  Start now:  systemctl --user start stt-daemon"
-echo "  Or:         bun run daemon"
+echo "  Start now:  systemctl --user start stt-daemon stt-status"
+echo "  Or:         bun run daemon  (+ bash scripts/dwm-status.sh in another terminal)"
 echo ""
-echo "  Status bar: add this to your dwm status script:"
-echo "    stt=\$(cat /tmp/stt-status 2>/dev/null)"
-echo "    [[ -n \"\$stt\" ]] && echo \" \$stt\""
+echo "  dwm bar:    🎤 gray=idle  🔴🎤 red=recording  🟡🎤 yellow=transcribing"
+echo "  Colors:     set DWM_STATUS_COLORS=true in .env if dwm has status2d patch"

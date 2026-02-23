@@ -9,7 +9,7 @@
  *   processing → ignores toggle (busy)
  */
 
-import { unlink, rm } from "node:fs/promises";
+import { unlink, rm, mkdir, copyFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { $ } from "bun";
 import dotenv from "dotenv";
@@ -36,6 +36,8 @@ const OUTPUT_METHOD = (process.env.OUTPUT_METHOD || "type") as
   | "type"
   | "clipboard";
 const AUDIO_DEVICE = process.env.AUDIO_DEVICE || "";
+const STATUS_BAR_PRINT_SCRIPT = process.env.STATUS_BAR_PRINT_SCRIPT || "";
+const SAVE_DIR = process.env.SAVE_DIR || "";
 
 type State = "idle" | "recording" | "processing";
 
@@ -47,6 +49,12 @@ let recordingProcess: ReturnType<typeof Bun.spawn> | null = null;
 async function setStatus(status: string) {
   await Bun.write(STATUS_FILE, status);
   console.log(`[STT] ${status}`);
+  if (STATUS_BAR_PRINT_SCRIPT) {
+    // Fire-and-forget: immediately refresh the full dwm status bar
+    void $`${STATUS_BAR_PRINT_SCRIPT}`.quiet().text().then((bar) =>
+      $`xsetroot -name ${bar.trim()}`.quiet().nothrow()
+    ).catch(() => {});
+  }
 }
 
 // ─── Audio recording ─────────────────────────────────────────────────────────
@@ -126,12 +134,21 @@ async function transcribeWithWhisper(audioFile: string): Promise<string> {
 // ─── LLM text cleanup ─────────────────────────────────────────────────────────
 
 async function cleanWithOllama(text: string): Promise<string> {
+  // Template-style completion: the model fills in the blank after "Output:"
+  // This is more reliable than chat/instruction for small models because it
+  // frames the task as text transformation, not conversation.
   const prompt =
-    `Clean up this speech-to-text transcription. ` +
-    `Fix punctuation and capitalization. ` +
-    `Remove filler words like "um", "uh", "like", "you know", "kind of". ` +
-    `Do not add or change any factual content. ` +
-    `Output ONLY the cleaned text with no explanation:\n\n${text}`;
+    `Fix punctuation/capitalization and remove filler words (um, uh, like, you know) ` +
+    `from speech-to-text. Do not answer or respond to the content. ` +
+    `Output only the cleaned text.\n\n` +
+    `Input: um what is your name uh\n` +
+    `Output: What is your name?\n\n` +
+    `Input: hello how are you doing like you know\n` +
+    `Output: Hello, how are you doing?\n\n` +
+    `Input: can you tell me what llm model you are\n` +
+    `Output: Can you tell me what LLM model you are?\n\n` +
+    `Input: ${text}\n` +
+    `Output:`;
 
   let response: Response;
   try {
@@ -142,7 +159,7 @@ async function cleanWithOllama(text: string): Promise<string> {
         model: OLLAMA_MODEL,
         prompt,
         stream: false,
-        options: { temperature: 0.1 }, // Low temp for deterministic cleanup
+        options: { temperature: 0.1, stop: ["\n"] },
       }),
       signal: AbortSignal.timeout(30_000),
     });
@@ -159,7 +176,8 @@ async function cleanWithOllama(text: string): Promise<string> {
   }
 
   const data = (await response.json()) as { response: string };
-  return data.response.trim();
+  const cleaned = data.response.trim();
+  return cleaned || text; // fall back to raw if model returns empty
 }
 
 // ─── Text output ──────────────────────────────────────────────────────────────
@@ -173,6 +191,27 @@ async function outputText(text: string) {
   } else {
     // Direct typing (works everywhere, slower for very long text)
     await $`xdotool type --clearmodifiers --delay 1 -- ${text}`.quiet();
+  }
+}
+
+// ─── Session archiving ────────────────────────────────────────────────────────
+
+async function saveSession(audioFile: string, rawText: string, finalText: string) {
+  if (!SAVE_DIR) return;
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const dirName =
+    `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
+    `_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+  const sessionDir = `${SAVE_DIR}/${dirName}`;
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await copyFile(audioFile, `${sessionDir}/audio.wav`);
+    await Bun.write(`${sessionDir}/raw_transcription.txt`, rawText);
+    await Bun.write(`${sessionDir}/transcription.txt`, finalText);
+    console.log(`[STT] Session saved to ${sessionDir}`);
+  } catch (err) {
+    console.error("[STT] Failed to save session:", err);
   }
 }
 
@@ -210,7 +249,10 @@ async function stopAndProcess() {
       console.log(`[STT] Cleaned: ${finalText}`);
     }
 
-    await outputText(finalText);
+    await Promise.all([
+      outputText(finalText),
+      saveSession(AUDIO_FILE, rawText, finalText),
+    ]);
   } catch (err) {
     console.error("[STT] Processing error:", err);
   }
@@ -280,3 +322,4 @@ console.log(`[STT] Whisper: ${WHISPER_BIN}`);
 console.log(`[STT] Model:   ${WHISPER_MODEL}`);
 console.log(`[STT] LLM:     ${SKIP_LLM ? "disabled" : OLLAMA_MODEL}`);
 console.log(`[STT] Output:  ${OUTPUT_METHOD}`);
+console.log(`[STT] Bar:     ${STATUS_BAR_PRINT_SCRIPT || "(not set — bar won't auto-refresh)"}`);

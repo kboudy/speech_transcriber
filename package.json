@@ -7,7 +7,8 @@
     "daemon": "bun run src/daemon.ts",
     "toggle": "bun run src/toggle.ts",
     "devices": "bun run src/devices.ts",
-    "setup": "bash scripts/setup.sh"
+    "setup": "bash scripts/setup.sh",
+    "last_stt": "bun run src/last_stt.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"
@@ -16,6 +17,7 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "chalk": "^5.6.2",
     "dotenv": "^17.3.1"
   }
 }
