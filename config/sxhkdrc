@@ -1,0 +1,7 @@
+# Speech-to-text toggle
+# Default: Super + grave (backtick)
+# Change this to whatever key combination you prefer.
+# Reload sxhkd after editing: pkill -USR1 sxhkd
+
+super + grave
+    bun run --cwd /home/keith/keith_apps/speech_to_text toggle

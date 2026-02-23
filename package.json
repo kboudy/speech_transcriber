@@ -1,0 +1,21 @@
+{
+  "name": "speech_to_text",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "daemon": "bun run src/daemon.ts",
+    "toggle": "bun run src/toggle.ts",
+    "devices": "bun run src/devices.ts",
+    "setup": "bash scripts/setup.sh"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "dotenv": "^17.3.1"
+  }
+}
