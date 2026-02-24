@@ -44,6 +44,15 @@ type State = "idle" | "recording" | "processing";
 let state: State = "idle";
 let recordingProcess: ReturnType<typeof Bun.spawn> | null = null;
 
+// Export for testing
+export function getState(): State {
+  return state;
+}
+
+export function setState(newState: State): void {
+  state = newState;
+}
+
 // ─── Status bar ──────────────────────────────────────────────────────────────
 
 async function setStatus(status: string) {
@@ -61,7 +70,7 @@ async function setStatus(status: string) {
 
 // ─── Audio recording ─────────────────────────────────────────────────────────
 
-async function getRecordingCommand(): Promise<string[]> {
+export async function getRecordingCommand(): Promise<string[]> {
   // Prefer parecord (PipeWire/PulseAudio), fall back to arecord (ALSA)
   try {
     await $`which parecord`.quiet();
@@ -270,7 +279,7 @@ async function stopAndProcess() {
   state = "idle";
 }
 
-async function handleMessage(msg: string) {
+export async function handleMessage(msg: string) {
   const cmd = msg.trim();
   if (cmd === "toggle") {
     if (state === "idle") {
