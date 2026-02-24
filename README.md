@@ -58,17 +58,17 @@ sxhkd &
 
 Copy `.env.example` to `.env` and edit:
 
-| Variable        | Default                                                | Description                              |
-| --------------- | ------------------------------------------------------ | ---------------------------------------- |
-| `WHISPER_BIN`   | `~/.local/share/stt/whisper.cpp/build/bin/whisper-cli` | Path to whisper.cpp binary               |
-| `WHISPER_MODEL` | `~/.local/share/stt/models/ggml-large-v3.bin`          | Whisper model file                       |
-| `OLLAMA_MODEL`           | `llama3.2:3b`                                          | Ollama model for text cleanup                      |
-| `OLLAMA_URL`             | `http://localhost:11434`                               | Ollama API base URL                                |
-| `SKIP_LLM`               | `false`                                                | Set to `true` to skip LLM cleanup                  |
-| `OUTPUT_METHOD`          | `type`                                                 | `type` (xdotool) or `clipboard` (Ctrl+V)           |
-| `AUDIO_DEVICE`           | _(system default)_                                     | Specific mic device (parecord `--device` or arecord `-D`) |
-| `SAVE_DIR`               | _(unset)_                                              | Directory to archive sessions (see below)                 |
-| `STATUS_BAR_PRINT_SCRIPT`| _(unset)_                                              | Script to run after status changes (e.g. dwm bar refresh) |
+| Variable                  | Default                                                | Description                                               |
+| ------------------------- | ------------------------------------------------------ | --------------------------------------------------------- |
+| `WHISPER_BIN`             | `~/.local/share/stt/whisper.cpp/build/bin/whisper-cli` | Path to whisper.cpp binary                                |
+| `WHISPER_MODEL`           | `~/.local/share/stt/models/ggml-large-v3.bin`          | Whisper model file                                        |
+| `OLLAMA_MODEL`            | `llama3.2:3b`                                          | Ollama model for text cleanup                             |
+| `OLLAMA_URL`              | `http://localhost:11434`                               | Ollama API base URL                                       |
+| `SKIP_LLM`                | `false`                                                | Set to `true` to skip LLM cleanup                         |
+| `OUTPUT_METHOD`           | `type`                                                 | `type` (xdotool) or `clipboard` (Ctrl+V)                  |
+| `AUDIO_DEVICE`            | _(system default)_                                     | Specific mic device (parecord `--device` or arecord `-D`) |
+| `SAVE_DIR`                | _(unset)_                                              | Directory to archive sessions (see below)                 |
+| `STATUS_BAR_PRINT_SCRIPT` | _(unset)_                                              | Script to run after status changes (e.g. dwm bar refresh) |
 
 ## Session archiving
 
