@@ -1,12 +1,12 @@
 #!/usr/bin/env bun
 /**
  * STT Daemon - persistent background process
- * Listens on a Unix socket for toggle commands from toggle.ts (called by sxhkd)
+ * Listens on a Unix socket for commands from toggle.ts (called by sxhkd)
  *
  * States:
- *   idle       → receives "toggle" → starts recording
- *   recording  → receives "toggle" → stops, transcribes, cleans, types
- *   processing → ignores toggle (busy)
+ *   idle       → receives "start" → starts recording
+ *   recording  → receives "stop"  → stops, transcribes, cleans, types
+ *   processing → ignores commands (busy)
  */
 
 import { unlink, rm, mkdir, copyFile } from "node:fs/promises";
@@ -282,12 +282,22 @@ async function stopAndProcess() {
 export async function handleMessage(msg: string) {
   const cmd = msg.trim();
   if (cmd === "toggle") {
+    // Legacy toggle behavior
     if (state === "idle") {
       await startRecording();
     } else if (state === "recording") {
       await stopAndProcess();
     } else {
       console.log("[STT] Busy, ignoring toggle");
+    }
+  } else if (cmd === "start") {
+    // Push-to-talk: start recording (only if idle)
+    if (state === "idle") {
+      await startRecording();
+    } else if (state === "recording") {
+      console.log("[STT] Already recording");
+    } else {
+      console.log("[STT] Busy, ignoring start");
     }
   } else if (cmd === "stop" && state === "recording") {
     await stopAndProcess();

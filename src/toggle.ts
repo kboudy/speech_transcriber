@@ -1,10 +1,12 @@
 #!/usr/bin/env bun
 /**
- * Toggle script — called by sxhkd on hotkey press.
- * Connects to the daemon's Unix socket and sends "toggle".
+ * Toggle script — called by sxhkd on hotkey press/release.
+ * Connects to the daemon's Unix socket and sends "start" or "stop".
  */
 
 const SOCKET_PATH = "/tmp/stt-daemon.sock";
+
+const cmd = process.argv[2] || "toggle";
 
 const socket = await Bun.connect({
   unix: SOCKET_PATH,
@@ -21,7 +23,7 @@ const socket = await Bun.connect({
       process.exit(1);
     },
     open(socket) {
-      socket.write("toggle\n");
+      socket.write(`${cmd}\n`);
       socket.end();
     },
     close() {
