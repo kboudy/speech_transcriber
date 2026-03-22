@@ -28,6 +28,7 @@ const WHISPER_BIN =
 const WHISPER_MODEL =
   process.env.WHISPER_MODEL ||
   `${process.env.HOME}/.local/share/stt/models/ggml-large-v3.bin`;
+const WHISPER_SERVER_URL = process.env.WHISPER_SERVER_URL || "";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "llama3.2:3b";
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
 const SKIP_LLM = process.env.SKIP_LLM === "true";
@@ -104,7 +105,30 @@ async function transcribeChunk(chunkFile: string) {
   await outputText(finalText + " ");
 }
 
+async function startWhisperServer() {
+  await $`systemctl --user start whisper-server.service`.quiet().nothrow();
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`${WHISPER_SERVER_URL}/`, { signal: AbortSignal.timeout(500) });
+      if (res.status < 500) return;
+    } catch {}
+    await Bun.sleep(200);
+  }
+  console.warn("[STT] whisper-server did not become ready in time");
+}
+
+async function stopWhisperServer() {
+  await $`systemctl --user stop whisper-server.service`.quiet().nothrow();
+}
+
 async function runStreamingLoop() {
+  if (WHISPER_SERVER_URL) {
+    await setStatus("[...]");
+    await startWhisperServer();
+  }
+  await setStatus("[REC]");
+
   const stopPromise = new Promise<void>((resolve) => {
     streamStop = resolve;
   });
@@ -140,26 +164,61 @@ async function runStreamingLoop() {
 
   state = "idle";
   streamStop = null;
+  if (WHISPER_SERVER_URL) await stopWhisperServer();
   await setStatus("[idle]");
 }
 
 // ─── Whisper transcription ────────────────────────────────────────────────────
 
 async function transcribeWithWhisper(audioFile: string): Promise<string> {
+  console.log(`[STT] Transcribing with whisper.cpp...`);
+  if (WHISPER_SERVER_URL) {
+    return transcribeViaServer(audioFile);
+  }
+  return transcribeViaCLI(audioFile);
+}
+
+async function transcribeViaServer(audioFile: string): Promise<string> {
+  const file = Bun.file(audioFile);
+  if (!await file.exists()) return "";
+
+  const formData = new FormData();
+  const blob = new Blob([await file.arrayBuffer()], { type: "audio/wav" });
+  formData.append("file", blob, "audio.wav");
+  formData.append("language", "en");
+  formData.append("response_format", "json");
+
+  let response: Response;
+  try {
+    response = await fetch(`${WHISPER_SERVER_URL}/inference`, {
+      method: "POST",
+      body: formData,
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (err) {
+    console.error("[STT] whisper-server request failed:", err);
+    return "";
+  }
+
+  if (!response.ok) {
+    console.error(`[STT] whisper-server error: ${response.status} ${response.statusText}`);
+    return "";
+  }
+
+  const data = await response.json() as { text: string };
+  const text = data.text?.trim() ?? "";
+  if (text === "[BLANK_AUDIO]" || text === "") return "";
+  return text;
+}
+
+async function transcribeViaCLI(audioFile: string): Promise<string> {
   const outputTxt = `${audioFile}.txt`;
 
-  // Remove any stale output file
   try {
     await rm(outputTxt, { force: true });
   } catch {}
 
-  console.log(`[STT] Transcribing with whisper.cpp...`);
-
-  // Flags:
-  //   -nt   : no timestamps in output
-  //   -otxt : write transcript to <audio>.txt
-  //   -np   : no progress bars
-  //   -l en : force English (remove if you need multilingual)
+  // Flags: -nt no timestamps, -otxt write to <audio>.txt, -np no progress, -l en force English
   await $`${WHISPER_BIN} -m ${WHISPER_MODEL} -f ${audioFile} -nt -otxt -np -l en`
     .quiet()
     .nothrow();
@@ -167,7 +226,6 @@ async function transcribeWithWhisper(audioFile: string): Promise<string> {
   const file = Bun.file(outputTxt);
   if (await file.exists()) {
     const text = (await file.text()).trim();
-    // whisper.cpp sometimes outputs "[BLANK_AUDIO]" for silence
     if (text === "[BLANK_AUDIO]" || text === "") return "";
     return text;
   }
@@ -245,7 +303,6 @@ export async function handleMessage(msg: string) {
   if (cmd === "toggle") {
     if (state === "idle") {
       state = "recording";
-      await setStatus("[REC]");
       void runStreamingLoop();
     } else if (state === "recording") {
       streamStop?.();
@@ -255,7 +312,6 @@ export async function handleMessage(msg: string) {
   } else if (cmd === "start") {
     if (state === "idle") {
       state = "recording";
-      await setStatus("[REC]");
       void runStreamingLoop();
     } else if (state === "recording") {
       console.log("[STT] Already recording");
