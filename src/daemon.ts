@@ -39,10 +39,13 @@ const AUDIO_DEVICE = process.env.AUDIO_DEVICE || "";
 const STATUS_BAR_PRINT_SCRIPT = process.env.STATUS_BAR_PRINT_SCRIPT || "";
 const SAVE_DIR = process.env.SAVE_DIR || "";
 
+const STREAM_CHUNK_MS = parseInt(process.env.STREAM_CHUNK_MS || "4000");
+
 type State = "idle" | "recording" | "processing";
 
 let state: State = "idle";
 let recordingProcess: ReturnType<typeof Bun.spawn> | null = null;
+let streamStop: (() => void) | null = null;
 
 // Export for testing
 export function getState(): State {
@@ -70,7 +73,7 @@ async function setStatus(status: string) {
 
 // ─── Audio recording ─────────────────────────────────────────────────────────
 
-export async function getRecordingCommand(): Promise<string[]> {
+export async function getRecordingCommand(audioFile: string = AUDIO_FILE): Promise<string[]> {
   // Prefer parecord (PipeWire/PulseAudio), fall back to arecord (ALSA)
   try {
     await $`which parecord`.quiet();
@@ -83,12 +86,12 @@ export async function getRecordingCommand(): Promise<string[]> {
       "--latency-msec=50", // small buffer so <50ms of audio is lost on SIGTERM
     ];
     if (AUDIO_DEVICE) cmd.push(`--device=${AUDIO_DEVICE}`);
-    cmd.push(AUDIO_FILE);
+    cmd.push(audioFile);
     return cmd;
   } catch {
     const cmd = ["arecord", "-f", "S16_LE", "-r", "16000", "-c", "1"];
     if (AUDIO_DEVICE) cmd.push("-D", AUDIO_DEVICE);
-    cmd.push(AUDIO_FILE);
+    cmd.push(audioFile);
     return cmd;
   }
 }
@@ -109,6 +112,58 @@ async function startRecording() {
     stdout: "ignore",
     stderr: "ignore",
   });
+}
+
+// ─── Streaming transcription loop ────────────────────────────────────────────
+
+async function transcribeChunk(chunkFile: string) {
+  const rawText = await transcribeWithWhisper(chunkFile);
+  try { await rm(chunkFile, { force: true }); } catch {}
+  if (!rawText) return;
+
+  console.log(`[STT] Chunk: ${rawText}`);
+
+  let finalText = rawText;
+  if (!SKIP_LLM) {
+    finalText = await cleanWithOllama(rawText);
+  }
+
+  await outputText(finalText + " ");
+}
+
+async function runStreamingLoop() {
+  const stopPromise = new Promise<void>((resolve) => {
+    streamStop = resolve;
+  });
+
+  let chunkIdx = 0;
+
+  while (true) {
+    const chunkFile = `/tmp/stt-chunk-${chunkIdx++}.wav`;
+    try { await rm(chunkFile, { force: true }); } catch {}
+
+    const cmd = await getRecordingCommand(chunkFile);
+    const proc = Bun.spawn(cmd, { stdout: "ignore", stderr: "ignore" });
+    recordingProcess = proc;
+
+    const result = await Promise.race([
+      Bun.sleep(STREAM_CHUNK_MS).then(() => "chunk" as const),
+      stopPromise.then(() => "stop" as const),
+    ]);
+
+    proc.kill("SIGTERM");
+    recordingProcess = null;
+    await Promise.race([proc.exited, Bun.sleep(1000)]);
+
+    // Transcribe in the background so the next chunk starts immediately
+    void transcribeChunk(chunkFile);
+
+    if (result === "stop") break;
+  }
+
+  state = "idle";
+  streamStop = null;
+  await setStatus("[idle]");
 }
 
 // ─── Whisper transcription ────────────────────────────────────────────────────
@@ -282,11 +337,12 @@ async function stopAndProcess() {
 export async function handleMessage(msg: string) {
   const cmd = msg.trim();
   if (cmd === "toggle") {
-    // Legacy toggle behavior
     if (state === "idle") {
-      await startRecording();
+      state = "recording";
+      await setStatus("[REC]");
+      void runStreamingLoop();
     } else if (state === "recording") {
-      await stopAndProcess();
+      streamStop?.();
     } else {
       console.log("[STT] Busy, ignoring toggle");
     }
