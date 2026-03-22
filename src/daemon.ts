@@ -9,13 +9,12 @@
  *   processing → ignores commands (busy)
  */
 
-import { unlink, rm, mkdir, copyFile } from "node:fs/promises";
+import { unlink, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { $ } from "bun";
 import dotenv from "dotenv";
 
 const SOCKET_PATH = "/tmp/stt-daemon.sock";
-const AUDIO_FILE = "/tmp/stt-recording.wav";
 const STATUS_FILE = "/tmp/stt-status";
 const PID_FILE = "/tmp/stt-daemon.pid";
 
@@ -37,16 +36,11 @@ const OUTPUT_METHOD = (process.env.OUTPUT_METHOD || "type") as
   | "clipboard";
 const AUDIO_DEVICE = process.env.AUDIO_DEVICE || "";
 const STATUS_BAR_PRINT_SCRIPT = process.env.STATUS_BAR_PRINT_SCRIPT || "";
-const SAVE_DIR = process.env.SAVE_DIR || "";
 
 // VAD (voice activity detection) config
-const VAD_SILENCE_THRESHOLD = parseFloat(process.env.VAD_SILENCE_THRESHOLD || "0.01"); // RMS 0–1
+const VAD_SILENCE_THRESHOLD_PCT = process.env.VAD_SILENCE_THRESHOLD_PCT || "3%";
 const VAD_SILENCE_DURATION_MS = parseInt(process.env.VAD_SILENCE_DURATION_MS || "800");
-const VAD_MIN_SPEECH_MS = parseInt(process.env.VAD_MIN_SPEECH_MS || "300");
 const VAD_MAX_CHUNK_MS = parseInt(process.env.VAD_MAX_CHUNK_MS || "15000");
-
-const SAMPLE_RATE = 16000;
-const BYTES_PER_SAMPLE = 2; // s16le
 
 type State = "idle" | "recording" | "processing";
 
@@ -76,51 +70,6 @@ async function setStatus(status: string) {
       .then((bar) => $`xsetroot -name ${bar.trim()}`.quiet().nothrow())
       .catch(() => {});
   }
-}
-
-// ─── Audio recording ─────────────────────────────────────────────────────────
-
-export async function getRecordingCommand(
-  audioFile: string = AUDIO_FILE,
-): Promise<string[]> {
-  // Prefer parecord (PipeWire/PulseAudio), fall back to arecord (ALSA)
-  try {
-    await $`which parecord`.quiet();
-    const cmd = [
-      "parecord",
-      "--file-format=wav",
-      "--channels=1",
-      "--rate=16000",
-      "--format=s16le",
-      "--latency-msec=50", // small buffer so <50ms of audio is lost on SIGTERM
-    ];
-    if (AUDIO_DEVICE) cmd.push(`--device=${AUDIO_DEVICE}`);
-    cmd.push(audioFile);
-    return cmd;
-  } catch {
-    const cmd = ["arecord", "-f", "S16_LE", "-r", "16000", "-c", "1"];
-    if (AUDIO_DEVICE) cmd.push("-D", AUDIO_DEVICE);
-    cmd.push(audioFile);
-    return cmd;
-  }
-}
-
-async function startRecording() {
-  state = "recording";
-  await setStatus("[REC]");
-
-  // Remove stale audio file
-  try {
-    await rm(AUDIO_FILE, { force: true });
-  } catch {}
-
-  const cmd = await getRecordingCommand();
-  console.log(`[STT] Recording with: ${cmd.join(" ")}`);
-
-  recordingProcess = Bun.spawn(cmd, {
-    stdout: "ignore",
-    stderr: "ignore",
-  });
 }
 
 // ─── Streaming transcription loop ────────────────────────────────────────────
@@ -154,110 +103,40 @@ async function transcribeChunk(chunkFile: string) {
   await outputText(finalText + " ");
 }
 
-function buildWav(pcm: Buffer): Buffer {
-  const header = Buffer.alloc(44);
-  const byteRate = SAMPLE_RATE * BYTES_PER_SAMPLE;
-  header.write("RIFF", 0);
-  header.writeUInt32LE(36 + pcm.byteLength, 4);
-  header.write("WAVE", 8);
-  header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);                  // PCM
-  header.writeUInt16LE(1, 22);                  // mono
-  header.writeUInt32LE(SAMPLE_RATE, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(BYTES_PER_SAMPLE, 32);
-  header.writeUInt16LE(16, 34);                 // bits per sample
-  header.write("data", 36);
-  header.writeUInt32LE(pcm.byteLength, 40);
-  return Buffer.concat([header, pcm]);
-}
-
-function rms(data: Uint8Array): number {
-  const samples = Math.floor(data.byteLength / 2);
-  if (samples === 0) return 0;
-  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  let sum = 0;
-  for (let i = 0; i < samples; i++) {
-    const s = view.getInt16(i * 2, true) / 32768;
-    sum += s * s;
-  }
-  return Math.sqrt(sum / samples);
-}
-
 async function runStreamingLoop() {
   const stopPromise = new Promise<void>((resolve) => {
     streamStop = resolve;
   });
 
-  const proc = Bun.spawn(
-    ["ffmpeg", "-f", "pulse", "-i", AUDIO_DEVICE || "default",
-     "-ar", String(SAMPLE_RATE), "-ac", "1", "-f", "s16le", "pipe:1"],
-    { stdout: "pipe", stderr: "ignore" },
-  );
-  recordingProcess = proc;
-
-  let stopped = false;
-  stopPromise.then(() => { stopped = true; proc.kill(); });
-
-  const WINDOW_BYTES = Math.round(SAMPLE_RATE * BYTES_PER_SAMPLE / 100); // 10 ms
-  const silenceSamplesThresh = Math.round((VAD_SILENCE_DURATION_MS / 1000) * SAMPLE_RATE);
-  const minSpeechBytes = Math.round((VAD_MIN_SPEECH_MS / 1000) * SAMPLE_RATE) * BYTES_PER_SAMPLE;
-  const maxChunkBytes = Math.round((VAD_MAX_CHUNK_MS / 1000) * SAMPLE_RATE) * BYTES_PER_SAMPLE;
-
-  let chunkParts: Uint8Array[] = [];
-  let totalBytes = 0;
-  let silentSamples = 0;
+  const silenceDuration = (VAD_SILENCE_DURATION_MS / 1000).toFixed(2);
   let chunkIdx = 0;
-  let pending = Buffer.alloc(0);
 
-  async function flush() {
-    const pcm = Buffer.concat(chunkParts);
-    chunkParts = [];
-    totalBytes = 0;
-    silentSamples = 0;
-    if (pcm.byteLength < minSpeechBytes) return;
+  while (true) {
     const chunkFile = `/tmp/stt-chunk-${chunkIdx++}.wav`;
-    await Bun.write(chunkFile, buildWav(pcm));
+    const proc = Bun.spawn([
+      "sox", "-t", "pulseaudio", AUDIO_DEVICE || "default",
+      "-r", "16000", "-c", "1",
+      chunkFile,
+      "silence", "1", "0.1", VAD_SILENCE_THRESHOLD_PCT,
+                "1", silenceDuration, VAD_SILENCE_THRESHOLD_PCT,
+    ], { stdout: "ignore", stderr: "ignore" });
+    recordingProcess = proc;
+
+    const result = await Promise.race([
+      proc.exited.then(() => "done" as const),
+      stopPromise.then(() => "stop" as const),
+      Bun.sleep(VAD_MAX_CHUNK_MS).then(() => "timeout" as const),
+    ]);
+
+    if (proc.exitCode === null) proc.kill("SIGTERM");
+    recordingProcess = null;
+    await Promise.race([proc.exited, Bun.sleep(500)]);
+
     void transcribeChunk(chunkFile);
+
+    if (result === "stop") break;
   }
 
-  for await (const rawChunk of proc.stdout) {
-    if (stopped) break;
-
-    const buf = pending.byteLength > 0
-      ? Buffer.concat([pending, Buffer.from(rawChunk)])
-      : Buffer.from(rawChunk);
-    pending = Buffer.alloc(0);
-
-    let offset = 0;
-    while (offset + WINDOW_BYTES <= buf.byteLength) {
-      const window = buf.subarray(offset, offset + WINDOW_BYTES);
-      chunkParts.push(window);
-      totalBytes += WINDOW_BYTES;
-
-      const energy = rms(window);
-      if (energy < VAD_SILENCE_THRESHOLD) {
-        silentSamples += WINDOW_BYTES / BYTES_PER_SAMPLE;
-      } else {
-        silentSamples = 0;
-      }
-
-      if (silentSamples >= silenceSamplesThresh || totalBytes >= maxChunkBytes) {
-        await flush();
-      }
-
-      offset += WINDOW_BYTES;
-    }
-
-    if (offset < buf.byteLength) {
-      pending = Buffer.from(buf.subarray(offset));
-    }
-  }
-
-  if (totalBytes > 0) await flush();
-
-  recordingProcess = null;
   state = "idle";
   streamStop = null;
   await setStatus("[idle]");
@@ -358,78 +237,7 @@ async function outputText(text: string) {
   }
 }
 
-// ─── Session archiving ────────────────────────────────────────────────────────
-
-async function saveSession(
-  audioFile: string,
-  rawText: string,
-  finalText: string,
-) {
-  if (!SAVE_DIR) return;
-  const now = new Date();
-  const pad = (n: number) => String(n).padStart(2, "0");
-  const dirName =
-    `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
-    `_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
-  const sessionDir = `${SAVE_DIR}/${dirName}`;
-  try {
-    await mkdir(sessionDir, { recursive: true });
-    await copyFile(audioFile, `${sessionDir}/audio.wav`);
-    await Bun.write(`${sessionDir}/raw_transcription.txt`, rawText);
-    await Bun.write(`${sessionDir}/transcription.txt`, finalText);
-    console.log(`[STT] Session saved to ${sessionDir}`);
-  } catch (err) {
-    console.error("[STT] Failed to save session:", err);
-  }
-}
-
 // ─── Main toggle handler ──────────────────────────────────────────────────────
-
-async function stopAndProcess() {
-  state = "processing";
-  await setStatus("[...]");
-
-  // Stop recording and wait for the process to fully exit so all buffered
-  // audio is flushed to disk before we hand the file to whisper
-  const proc = recordingProcess;
-  recordingProcess = null;
-  proc?.kill("SIGTERM");
-  if (proc) {
-    await Promise.race([proc.exited, Bun.sleep(3000)]);
-  }
-
-  try {
-    await setStatus("[STT]");
-    const rawText = await transcribeWithWhisper(AUDIO_FILE);
-
-    if (!rawText) {
-      console.log("[STT] No speech detected");
-      await setStatus("[idle]");
-      state = "idle";
-      return;
-    }
-
-    console.log(`[STT] Transcribed: ${rawText}`);
-
-    let finalText = rawText;
-
-    if (!SKIP_LLM) {
-      await setStatus("[LLM]");
-      finalText = await cleanWithOllama(rawText);
-      console.log(`[STT] Cleaned: ${finalText}`);
-    }
-
-    await Promise.all([
-      outputText(finalText),
-      saveSession(AUDIO_FILE, rawText, finalText),
-    ]);
-  } catch (err) {
-    console.error("[STT] Processing error:", err);
-  }
-
-  await setStatus("[idle]");
-  state = "idle";
-}
 
 export async function handleMessage(msg: string) {
   const cmd = msg.trim();
