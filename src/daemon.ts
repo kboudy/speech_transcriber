@@ -38,7 +38,8 @@ const AUDIO_DEVICE = process.env.AUDIO_DEVICE || "";
 const STATUS_BAR_PRINT_SCRIPT = process.env.STATUS_BAR_PRINT_SCRIPT || "";
 
 // VAD (voice activity detection) config
-const VAD_SILENCE_THRESHOLD_PCT = process.env.VAD_SILENCE_THRESHOLD_PCT || "3%";
+const VAD_START_THRESHOLD_PCT = process.env.VAD_START_THRESHOLD_PCT || "1%";  // begin chunk when audio exceeds this
+const VAD_SILENCE_THRESHOLD_PCT = process.env.VAD_SILENCE_THRESHOLD_PCT || "3%"; // end chunk after this much silence
 const VAD_SILENCE_DURATION_MS = parseInt(process.env.VAD_SILENCE_DURATION_MS || "800");
 const VAD_MAX_CHUNK_MS = parseInt(process.env.VAD_MAX_CHUNK_MS || "15000");
 
@@ -117,7 +118,7 @@ async function runStreamingLoop() {
       "sox", "-t", "pulseaudio", AUDIO_DEVICE || "default",
       "-r", "16000", "-c", "1",
       chunkFile,
-      "silence", "1", "0.1", VAD_SILENCE_THRESHOLD_PCT,
+      "silence", "1", "0.05", VAD_START_THRESHOLD_PCT,
                 "1", silenceDuration, VAD_SILENCE_THRESHOLD_PCT,
     ], { stdout: "ignore", stderr: "ignore" });
     recordingProcess = proc;
