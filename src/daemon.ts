@@ -73,7 +73,9 @@ async function setStatus(status: string) {
 
 // ─── Audio recording ─────────────────────────────────────────────────────────
 
-export async function getRecordingCommand(audioFile: string = AUDIO_FILE): Promise<string[]> {
+export async function getRecordingCommand(
+  audioFile: string = AUDIO_FILE,
+): Promise<string[]> {
   // Prefer parecord (PipeWire/PulseAudio), fall back to arecord (ALSA)
   try {
     await $`which parecord`.quiet();
@@ -116,10 +118,28 @@ async function startRecording() {
 
 // ─── Streaming transcription loop ────────────────────────────────────────────
 
+// Common whisper hallucinations on silence/noise
+const WHISPER_HALLUCINATIONS = new Set([
+  "Thank you.",
+  "Thanks for watching.",
+  "Thank you for watching.",
+  "Thank you very much.",
+  "Thank you so much.",
+  "Thanks.",
+  "you",
+  "You.",
+  "Please.",
+  "Amen.",
+  "Bye.",
+  "Bye-bye.",
+]);
+
 async function transcribeChunk(chunkFile: string) {
   const rawText = await transcribeWithWhisper(chunkFile);
-  try { await rm(chunkFile, { force: true }); } catch {}
-  if (!rawText) return;
+  try {
+    await rm(chunkFile, { force: true });
+  } catch {}
+  if (!rawText || WHISPER_HALLUCINATIONS.has(rawText)) return;
 
   console.log(`[STT] Chunk: ${rawText}`);
 
@@ -140,7 +160,9 @@ async function runStreamingLoop() {
 
   while (true) {
     const chunkFile = `/tmp/stt-chunk-${chunkIdx++}.wav`;
-    try { await rm(chunkFile, { force: true }); } catch {}
+    try {
+      await rm(chunkFile, { force: true });
+    } catch {}
 
     const cmd = await getRecordingCommand(chunkFile);
     const proc = Bun.spawn(cmd, { stdout: "ignore", stderr: "ignore" });
@@ -155,7 +177,6 @@ async function runStreamingLoop() {
     recordingProcess = null;
     await Promise.race([proc.exited, Bun.sleep(1000)]);
 
-    // Transcribe in the background so the next chunk starts immediately
     void transcribeChunk(chunkFile);
 
     if (result === "stop") break;
@@ -347,16 +368,17 @@ export async function handleMessage(msg: string) {
       console.log("[STT] Busy, ignoring toggle");
     }
   } else if (cmd === "start") {
-    // Push-to-talk: start recording (only if idle)
     if (state === "idle") {
-      await startRecording();
+      state = "recording";
+      await setStatus("[REC]");
+      void runStreamingLoop();
     } else if (state === "recording") {
       console.log("[STT] Already recording");
     } else {
       console.log("[STT] Busy, ignoring start");
     }
-  } else if (cmd === "stop" && state === "recording") {
-    await stopAndProcess();
+  } else if (cmd === "stop") {
+    if (state === "recording") streamStop?.();
   }
 }
 
