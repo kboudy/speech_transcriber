@@ -39,7 +39,14 @@ const AUDIO_DEVICE = process.env.AUDIO_DEVICE || "";
 const STATUS_BAR_PRINT_SCRIPT = process.env.STATUS_BAR_PRINT_SCRIPT || "";
 const SAVE_DIR = process.env.SAVE_DIR || "";
 
-const STREAM_CHUNK_MS = parseInt(process.env.STREAM_CHUNK_MS || "4000");
+// VAD (voice activity detection) config
+const VAD_SILENCE_THRESHOLD = parseFloat(process.env.VAD_SILENCE_THRESHOLD || "0.01"); // RMS 0–1
+const VAD_SILENCE_DURATION_MS = parseInt(process.env.VAD_SILENCE_DURATION_MS || "800");
+const VAD_MIN_SPEECH_MS = parseInt(process.env.VAD_MIN_SPEECH_MS || "300");
+const VAD_MAX_CHUNK_MS = parseInt(process.env.VAD_MAX_CHUNK_MS || "15000");
+
+const SAMPLE_RATE = 16000;
+const BYTES_PER_SAMPLE = 2; // s16le
 
 type State = "idle" | "recording" | "processing";
 
@@ -121,10 +128,6 @@ async function startRecording() {
 // Common whisper hallucinations on silence/noise
 const WHISPER_HALLUCINATIONS = new Set([
   "Thank you.",
-  "Thanks for watching.",
-  "Thank you for watching.",
-  "Thank you very much.",
-  "Thank you so much.",
   "Thanks.",
   "you",
   "You.",
@@ -151,37 +154,110 @@ async function transcribeChunk(chunkFile: string) {
   await outputText(finalText + " ");
 }
 
+function buildWav(pcm: Buffer): Buffer {
+  const header = Buffer.alloc(44);
+  const byteRate = SAMPLE_RATE * BYTES_PER_SAMPLE;
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcm.byteLength, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);                  // PCM
+  header.writeUInt16LE(1, 22);                  // mono
+  header.writeUInt32LE(SAMPLE_RATE, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(BYTES_PER_SAMPLE, 32);
+  header.writeUInt16LE(16, 34);                 // bits per sample
+  header.write("data", 36);
+  header.writeUInt32LE(pcm.byteLength, 40);
+  return Buffer.concat([header, pcm]);
+}
+
+function rms(data: Uint8Array): number {
+  const samples = Math.floor(data.byteLength / 2);
+  if (samples === 0) return 0;
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let sum = 0;
+  for (let i = 0; i < samples; i++) {
+    const s = view.getInt16(i * 2, true) / 32768;
+    sum += s * s;
+  }
+  return Math.sqrt(sum / samples);
+}
+
 async function runStreamingLoop() {
   const stopPromise = new Promise<void>((resolve) => {
     streamStop = resolve;
   });
 
+  const proc = Bun.spawn(
+    ["ffmpeg", "-f", "pulse", "-i", AUDIO_DEVICE || "default",
+     "-ar", String(SAMPLE_RATE), "-ac", "1", "-f", "s16le", "pipe:1"],
+    { stdout: "pipe", stderr: "ignore" },
+  );
+  recordingProcess = proc;
+
+  let stopped = false;
+  stopPromise.then(() => { stopped = true; proc.kill(); });
+
+  const WINDOW_BYTES = Math.round(SAMPLE_RATE * BYTES_PER_SAMPLE / 100); // 10 ms
+  const silenceSamplesThresh = Math.round((VAD_SILENCE_DURATION_MS / 1000) * SAMPLE_RATE);
+  const minSpeechBytes = Math.round((VAD_MIN_SPEECH_MS / 1000) * SAMPLE_RATE) * BYTES_PER_SAMPLE;
+  const maxChunkBytes = Math.round((VAD_MAX_CHUNK_MS / 1000) * SAMPLE_RATE) * BYTES_PER_SAMPLE;
+
+  let chunkParts: Uint8Array[] = [];
+  let totalBytes = 0;
+  let silentSamples = 0;
   let chunkIdx = 0;
+  let pending = Buffer.alloc(0);
 
-  while (true) {
+  async function flush() {
+    const pcm = Buffer.concat(chunkParts);
+    chunkParts = [];
+    totalBytes = 0;
+    silentSamples = 0;
+    if (pcm.byteLength < minSpeechBytes) return;
     const chunkFile = `/tmp/stt-chunk-${chunkIdx++}.wav`;
-    try {
-      await rm(chunkFile, { force: true });
-    } catch {}
-
-    const cmd = await getRecordingCommand(chunkFile);
-    const proc = Bun.spawn(cmd, { stdout: "ignore", stderr: "ignore" });
-    recordingProcess = proc;
-
-    const result = await Promise.race([
-      Bun.sleep(STREAM_CHUNK_MS).then(() => "chunk" as const),
-      stopPromise.then(() => "stop" as const),
-    ]);
-
-    proc.kill("SIGTERM");
-    recordingProcess = null;
-    await Promise.race([proc.exited, Bun.sleep(1000)]);
-
+    await Bun.write(chunkFile, buildWav(pcm));
     void transcribeChunk(chunkFile);
-
-    if (result === "stop") break;
   }
 
+  for await (const rawChunk of proc.stdout) {
+    if (stopped) break;
+
+    const buf = pending.byteLength > 0
+      ? Buffer.concat([pending, Buffer.from(rawChunk)])
+      : Buffer.from(rawChunk);
+    pending = Buffer.alloc(0);
+
+    let offset = 0;
+    while (offset + WINDOW_BYTES <= buf.byteLength) {
+      const window = buf.subarray(offset, offset + WINDOW_BYTES);
+      chunkParts.push(window);
+      totalBytes += WINDOW_BYTES;
+
+      const energy = rms(window);
+      if (energy < VAD_SILENCE_THRESHOLD) {
+        silentSamples += WINDOW_BYTES / BYTES_PER_SAMPLE;
+      } else {
+        silentSamples = 0;
+      }
+
+      if (silentSamples >= silenceSamplesThresh || totalBytes >= maxChunkBytes) {
+        await flush();
+      }
+
+      offset += WINDOW_BYTES;
+    }
+
+    if (offset < buf.byteLength) {
+      pending = Buffer.from(buf.subarray(offset));
+    }
+  }
+
+  if (totalBytes > 0) await flush();
+
+  recordingProcess = null;
   state = "idle";
   streamStop = null;
   await setStatus("[idle]");
