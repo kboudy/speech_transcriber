@@ -9,12 +9,13 @@
  *   processing → ignores commands (busy)
  */
 
-import { unlink, rm } from "node:fs/promises";
+import { unlink, rm, mkdir, copyFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { $ } from "bun";
 import dotenv from "dotenv";
 
 const SOCKET_PATH = "/tmp/stt-daemon.sock";
+const AUDIO_FILE = "/tmp/stt-recording.wav";
 const STATUS_FILE = "/tmp/stt-status";
 const PID_FILE = "/tmp/stt-daemon.pid";
 
@@ -28,7 +29,6 @@ const WHISPER_BIN =
 const WHISPER_MODEL =
   process.env.WHISPER_MODEL ||
   `${process.env.HOME}/.local/share/stt/models/ggml-large-v3.bin`;
-const WHISPER_SERVER_URL = process.env.WHISPER_SERVER_URL || "";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "llama3.2:3b";
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
 const SKIP_LLM = process.env.SKIP_LLM === "true";
@@ -37,18 +37,12 @@ const OUTPUT_METHOD = (process.env.OUTPUT_METHOD || "type") as
   | "clipboard";
 const AUDIO_DEVICE = process.env.AUDIO_DEVICE || "";
 const STATUS_BAR_PRINT_SCRIPT = process.env.STATUS_BAR_PRINT_SCRIPT || "";
-
-// VAD (voice activity detection) config
-const VAD_START_THRESHOLD_PCT = process.env.VAD_START_THRESHOLD_PCT || "1%";  // begin chunk when audio exceeds this
-const VAD_SILENCE_THRESHOLD_PCT = process.env.VAD_SILENCE_THRESHOLD_PCT || "3%"; // end chunk after this much silence
-const VAD_SILENCE_DURATION_MS = parseInt(process.env.VAD_SILENCE_DURATION_MS || "800");
-const VAD_MAX_CHUNK_MS = parseInt(process.env.VAD_MAX_CHUNK_MS || "15000");
+const SAVE_DIR = process.env.SAVE_DIR || "";
 
 type State = "idle" | "recording" | "processing";
 
 let state: State = "idle";
 let recordingProcess: ReturnType<typeof Bun.spawn> | null = null;
-let streamStop: (() => void) | null = null;
 
 // Export for testing
 export function getState(): State {
@@ -74,151 +68,66 @@ async function setStatus(status: string) {
   }
 }
 
-// ─── Streaming transcription loop ────────────────────────────────────────────
+// ─── Audio recording ─────────────────────────────────────────────────────────
 
-// Common whisper hallucinations on silence/noise
-const WHISPER_HALLUCINATIONS = new Set([
-  "Thank you.",
-  "Thanks.",
-  "you",
-  "You.",
-  "Please.",
-  "Amen.",
-  "Bye.",
-  "Bye-bye.",
-]);
-
-async function transcribeChunk(chunkFile: string) {
-  const rawText = await transcribeWithWhisper(chunkFile);
+export async function getRecordingCommand(): Promise<string[]> {
+  // Prefer parecord (PipeWire/PulseAudio), fall back to arecord (ALSA)
   try {
-    await rm(chunkFile, { force: true });
-  } catch {}
-  if (!rawText || WHISPER_HALLUCINATIONS.has(rawText)) return;
-
-  console.log(`[STT] Chunk: ${rawText}`);
-
-  let finalText = rawText;
-  if (!SKIP_LLM) {
-    finalText = await cleanWithOllama(rawText);
+    await $`which parecord`.quiet();
+    const cmd = [
+      "parecord",
+      "--file-format=wav",
+      "--channels=1",
+      "--rate=16000",
+      "--format=s16le",
+      "--latency-msec=50", // small buffer so <50ms of audio is lost on SIGTERM
+    ];
+    if (AUDIO_DEVICE) cmd.push(`--device=${AUDIO_DEVICE}`);
+    cmd.push(AUDIO_FILE);
+    return cmd;
+  } catch {
+    const cmd = ["arecord", "-f", "S16_LE", "-r", "16000", "-c", "1"];
+    if (AUDIO_DEVICE) cmd.push("-D", AUDIO_DEVICE);
+    cmd.push(AUDIO_FILE);
+    return cmd;
   }
-
-  await outputText(finalText + " ");
 }
 
-async function startWhisperServer() {
-  await $`systemctl --user start whisper-server.service`.quiet().nothrow();
-  const deadline = Date.now() + 15_000;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`${WHISPER_SERVER_URL}/`, { signal: AbortSignal.timeout(500) });
-      if (res.status < 500) return;
-    } catch {}
-    await Bun.sleep(200);
-  }
-  console.warn("[STT] whisper-server did not become ready in time");
-}
-
-async function stopWhisperServer() {
-  await $`systemctl --user stop whisper-server.service`.quiet().nothrow();
-}
-
-async function runStreamingLoop() {
-  if (WHISPER_SERVER_URL) {
-    await setStatus("[...]");
-    await startWhisperServer();
-  }
+async function startRecording() {
+  state = "recording";
   await setStatus("[REC]");
 
-  const stopPromise = new Promise<void>((resolve) => {
-    streamStop = resolve;
+  // Remove stale audio file
+  try {
+    await rm(AUDIO_FILE, { force: true });
+  } catch {}
+
+  const cmd = await getRecordingCommand();
+  console.log(`[STT] Recording with: ${cmd.join(" ")}`);
+
+  recordingProcess = Bun.spawn(cmd, {
+    stdout: "ignore",
+    stderr: "ignore",
   });
-
-  const silenceDuration = (VAD_SILENCE_DURATION_MS / 1000).toFixed(2);
-  let chunkIdx = 0;
-
-  while (true) {
-    const chunkFile = `/tmp/stt-chunk-${chunkIdx++}.wav`;
-    const proc = Bun.spawn([
-      "sox", "-t", "pulseaudio", AUDIO_DEVICE || "default",
-      "-r", "16000", "-c", "1",
-      chunkFile,
-      "silence", "1", "0.05", VAD_START_THRESHOLD_PCT,
-                "1", silenceDuration, VAD_SILENCE_THRESHOLD_PCT,
-    ], { stdout: "ignore", stderr: "ignore" });
-    recordingProcess = proc;
-
-    const result = await Promise.race([
-      proc.exited.then(() => "done" as const),
-      stopPromise.then(() => "stop" as const),
-      Bun.sleep(VAD_MAX_CHUNK_MS).then(() => "timeout" as const),
-    ]);
-
-    if (proc.exitCode === null) proc.kill("SIGTERM");
-    recordingProcess = null;
-    await Promise.race([proc.exited, Bun.sleep(500)]);
-
-    void transcribeChunk(chunkFile);
-
-    if (result === "stop") break;
-  }
-
-  state = "idle";
-  streamStop = null;
-  if (WHISPER_SERVER_URL) await stopWhisperServer();
-  await setStatus("[idle]");
 }
 
 // ─── Whisper transcription ────────────────────────────────────────────────────
 
 async function transcribeWithWhisper(audioFile: string): Promise<string> {
-  console.log(`[STT] Transcribing with whisper.cpp...`);
-  if (WHISPER_SERVER_URL) {
-    return transcribeViaServer(audioFile);
-  }
-  return transcribeViaCLI(audioFile);
-}
-
-async function transcribeViaServer(audioFile: string): Promise<string> {
-  const file = Bun.file(audioFile);
-  if (!await file.exists()) return "";
-
-  const formData = new FormData();
-  const blob = new Blob([await file.arrayBuffer()], { type: "audio/wav" });
-  formData.append("file", blob, "audio.wav");
-  formData.append("language", "en");
-  formData.append("response_format", "json");
-
-  let response: Response;
-  try {
-    response = await fetch(`${WHISPER_SERVER_URL}/inference`, {
-      method: "POST",
-      body: formData,
-      signal: AbortSignal.timeout(30_000),
-    });
-  } catch (err) {
-    console.error("[STT] whisper-server request failed:", err);
-    return "";
-  }
-
-  if (!response.ok) {
-    console.error(`[STT] whisper-server error: ${response.status} ${response.statusText}`);
-    return "";
-  }
-
-  const data = await response.json() as { text: string };
-  const text = data.text?.trim() ?? "";
-  if (text === "[BLANK_AUDIO]" || text === "") return "";
-  return text;
-}
-
-async function transcribeViaCLI(audioFile: string): Promise<string> {
   const outputTxt = `${audioFile}.txt`;
 
+  // Remove any stale output file
   try {
     await rm(outputTxt, { force: true });
   } catch {}
 
-  // Flags: -nt no timestamps, -otxt write to <audio>.txt, -np no progress, -l en force English
+  console.log(`[STT] Transcribing with whisper.cpp...`);
+
+  // Flags:
+  //   -nt   : no timestamps in output
+  //   -otxt : write transcript to <audio>.txt
+  //   -np   : no progress bars
+  //   -l en : force English (remove if you need multilingual)
   await $`${WHISPER_BIN} -m ${WHISPER_MODEL} -f ${audioFile} -nt -otxt -np -l en`
     .quiet()
     .nothrow();
@@ -226,7 +135,8 @@ async function transcribeViaCLI(audioFile: string): Promise<string> {
   const file = Bun.file(outputTxt);
   if (await file.exists()) {
     const text = (await file.text()).trim();
-    if (text === "[BLANK_AUDIO]" || text === "") return "";
+    // whisper.cpp sometimes outputs "[BLANK_AUDIO]" for silence
+    if (text === "[BLANK_AUDIO]" || text === "" || text === "Thank you.") return "";
     return text;
   }
 
@@ -296,30 +206,101 @@ async function outputText(text: string) {
   }
 }
 
+// ─── Session archiving ────────────────────────────────────────────────────────
+
+async function saveSession(
+  audioFile: string,
+  rawText: string,
+  finalText: string,
+) {
+  if (!SAVE_DIR) return;
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const dirName =
+    `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
+    `_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+  const sessionDir = `${SAVE_DIR}/${dirName}`;
+  try {
+    await mkdir(sessionDir, { recursive: true });
+    await copyFile(audioFile, `${sessionDir}/audio.wav`);
+    await Bun.write(`${sessionDir}/raw_transcription.txt`, rawText);
+    await Bun.write(`${sessionDir}/transcription.txt`, finalText);
+    console.log(`[STT] Session saved to ${sessionDir}`);
+  } catch (err) {
+    console.error("[STT] Failed to save session:", err);
+  }
+}
+
 // ─── Main toggle handler ──────────────────────────────────────────────────────
+
+async function stopAndProcess() {
+  state = "processing";
+  await setStatus("[...]");
+
+  // Stop recording and wait for the process to fully exit so all buffered
+  // audio is flushed to disk before we hand the file to whisper
+  const proc = recordingProcess;
+  recordingProcess = null;
+  proc?.kill("SIGTERM");
+  if (proc) {
+    await Promise.race([proc.exited, Bun.sleep(3000)]);
+  }
+
+  try {
+    await setStatus("[STT]");
+    const rawText = await transcribeWithWhisper(AUDIO_FILE);
+
+    if (!rawText) {
+      console.log("[STT] No speech detected");
+      await setStatus("[idle]");
+      state = "idle";
+      return;
+    }
+
+    console.log(`[STT] Transcribed: ${rawText}`);
+
+    let finalText = rawText;
+
+    if (!SKIP_LLM) {
+      await setStatus("[LLM]");
+      finalText = await cleanWithOllama(rawText);
+      console.log(`[STT] Cleaned: ${finalText}`);
+    }
+
+    await Promise.all([
+      outputText(finalText),
+      saveSession(AUDIO_FILE, rawText, finalText),
+    ]);
+  } catch (err) {
+    console.error("[STT] Processing error:", err);
+  }
+
+  await setStatus("[idle]");
+  state = "idle";
+}
 
 export async function handleMessage(msg: string) {
   const cmd = msg.trim();
   if (cmd === "toggle") {
+    // Legacy toggle behavior
     if (state === "idle") {
-      state = "recording";
-      void runStreamingLoop();
+      await startRecording();
     } else if (state === "recording") {
-      streamStop?.();
+      await stopAndProcess();
     } else {
       console.log("[STT] Busy, ignoring toggle");
     }
   } else if (cmd === "start") {
+    // Push-to-talk: start recording (only if idle)
     if (state === "idle") {
-      state = "recording";
-      void runStreamingLoop();
+      await startRecording();
     } else if (state === "recording") {
       console.log("[STT] Already recording");
     } else {
       console.log("[STT] Busy, ignoring start");
     }
-  } else if (cmd === "stop") {
-    if (state === "recording") streamStop?.();
+  } else if (cmd === "stop" && state === "recording") {
+    await stopAndProcess();
   }
 }
 
