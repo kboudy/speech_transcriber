@@ -59,8 +59,9 @@ async function setStatus(status: string) {
   await Bun.write(STATUS_FILE, status);
   console.log(`[STT] ${status}`);
   if (STATUS_BAR_PRINT_SCRIPT) {
-    // Fire-and-forget: immediately refresh the full dwm status bar
-    void $`${STATUS_BAR_PRINT_SCRIPT}`
+    // Set the status token immediately, then do a full bar refresh once the script finishes
+    void $`xsetroot -name ${status}`.quiet().nothrow();
+    void $`${STATUS_BAR_PRINT_SCRIPT} --fast`
       .quiet()
       .text()
       .then((bar) => $`xsetroot -name ${bar.trim()}`.quiet().nothrow())
@@ -136,7 +137,8 @@ async function transcribeWithWhisper(audioFile: string): Promise<string> {
   if (await file.exists()) {
     const text = (await file.text()).trim();
     // whisper.cpp sometimes outputs "[BLANK_AUDIO]" for silence
-    if (text === "[BLANK_AUDIO]" || text === "" || text === "Thank you.") return "";
+    if (text === "[BLANK_AUDIO]" || text === "" || text === "Thank you.")
+      return "";
     return text;
   }
 
